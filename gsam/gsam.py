@@ -24,9 +24,9 @@ class GSAM(tf.keras.Model):
             loss = self.compiled_loss(y, predictions)
         trainable_params = self.model.trainable_variables
         gradients = tape.gradient(loss, trainable_params)
-        grad_norm = self._gradients_order2_norm(gradients)
-        scale = self.rho / (grad_norm + self.eps)
-        for (grad, param) in zip(gradients, trainable_params):
+        grad_norms = [tf.norm(grad) for grad in gradients if grad is not None]
+        layer_scales = [self.rho / (grad_norm + self.eps) for grad_norm in grad_norms]
+        for (grad, param, scale) in zip(gradients, trainable_params, layer_scales):
             e_w = grad * scale
             self._distributed_apply_epsilon_w(
                 param, e_w, tf.distribute.get_strategy()
