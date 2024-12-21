@@ -1,8 +1,8 @@
 import tensorflow as tf
 
 class AGSAM(tf.keras.Model):
-    """Surrogate Gap Guided Sharpness-Aware Minimization
-    (GSAM) training flow. https://arxiv.org/abs/2203.08065
+    """Surrogate Gap Guided Sharpness-Aware Minimization (GSAM) training flow.
+    This code incorporates scale-invariance inspired by ASAM.
     """
     def __init__(self, model, rho=0.05, alpha=0.1, eps=1e-12, name=None):
         super().__init__(name=name)
@@ -10,69 +10,68 @@ class AGSAM(tf.keras.Model):
         self.rho = rho
         self.alpha = alpha
         self.eps = eps
-        
+
     def train_step(self, data):
         if len(data) == 3:
             x, y, sample_weight = data
         else:
             sample_weight = None
             x, y = data
-            
+
         e_ws = []
+        
+        # First forward pass to compute loss and gradients
         with tf.GradientTape() as tape:
             predictions = self.model(x)
             loss = self.compiled_loss(y, predictions)
         trainable_params = self.model.trainable_variables
         gradients = tape.gradient(loss, trainable_params)
-        grad_norms = [tf.norm(grad) for grad in gradients if grad is not None]
-        layer_scales = [self.rho / (grad_norm + self.eps) for grad_norm in grad_norms]
-        for (grad, param, scale) in zip(gradients, trainable_params, layer_scales):
-            e_w = grad * scale
-            self._distributed_apply_epsilon_w(
-                param, e_w, tf.distribute.get_strategy()
-            )
+        
+        # Compute the gradient norm to get scaling factor (scale-invariant part)
+        grad_norm = self._gradients_order2_norm(gradients)
+        scale = self.rho / (grad_norm + self.eps)
+
+        for grad, param in zip(gradients, trainable_params):
+            e_w = grad * scale  # Apply perturbation with scaling factor
+            self._distributed_apply_epsilon_w(param, e_w, tf.distribute.get_strategy())
             e_ws.append(e_w)
 
+        # Second forward pass after perturbing the weights to compute perturbed loss and gradients
         with tf.GradientTape() as tape:
             predictions = self.model(x)
-            loss = self.compiled_loss(y, predictions)    
+            loss = self.compiled_loss(y, predictions)
         
         sam_gradients = tape.gradient(loss, trainable_params)
         sam_grad_norm = self._gradients_order2_norm(sam_gradients)
-        for (param, e_w) in zip(trainable_params, e_ws):
-            # Restore the variable to its original value before
-            # `apply_gradients()`.
-            self._distributed_apply_epsilon_w(
-                    param, -e_w, tf.distribute.get_strategy()
-            )
+        
+        # Restore the perturbed weights
+        for param, e_w in zip(trainable_params, e_ws):
+            self._distributed_apply_epsilon_w(param, -e_w, tf.distribute.get_strategy())
 
+        # Compute the dot product and parallel/orthogonal components of the gradient
         dot_product = sum(
-            [tf.reduce_sum(grad * sam_grad) for grad, sam_grad in zip(gradients,sam_gradients)
-                if grad is not None and sam_grad is not None]
+            [tf.reduce_sum(grad * sam_grad) for grad, sam_grad in zip(gradients, sam_gradients)
+             if grad is not None and sam_grad is not None]
         )
-        grads_parallel = [sam_grad*dot_product/(sam_grad_norm**2 + self.eps) for sam_grad in sam_gradients]
-        grads_orthogonal = [grad-grad_par  for grad,grad_par in zip(gradients,grads_parallel)]
+        
+        grads_parallel = [sam_grad * dot_product / (sam_grad_norm ** 2 + self.eps) for sam_grad in sam_gradients]
+        grads_orthogonal = [grad - grad_par for grad, grad_par in zip(gradients, grads_parallel)]
 
-        final_grad = [sam_grad-self.alpha*grad_ortho  for sam_grad,grad_ortho in zip(sam_gradients,grads_orthogonal)]
+        final_grad = [sam_grad - self.alpha * grad_ortho for sam_grad, grad_ortho in zip(sam_gradients, grads_orthogonal)]
 
-        self.optimizer.apply_gradients(
-            zip(final_grad, trainable_params))
-         
+        # Apply the final gradients
+        self.optimizer.apply_gradients(zip(final_grad, trainable_params))
+
+        # Update metrics and return results
         self.compiled_metrics.update_state(y, predictions, sample_weight=sample_weight)
         return {m.name: m.result() for m in self.metrics}
-    
+
     def call(self, inputs):
-        """Forward pass of GSAM.
-        GSAM delegates the forward pass call to the wrapped model.
-        Args:
-          inputs: Tensor. The model inputs.
-        Returns:
-          A Tensor, the outputs of the wrapped model for given `inputs`.
-        """
+        """Forward pass of GSAM. This method delegates to the wrapped model."""
         return self.model(inputs)
-       
+
     def _distributed_apply_epsilon_w(self, var, epsilon_w, strategy):
-        # Helper function to apply epsilon_w on model variables.
+        """Helper function to apply epsilon_w on model variables in a distributed setting."""
         if isinstance(
             tf.distribute.get_strategy(),
             (
@@ -94,12 +93,11 @@ class AGSAM(tf.keras.Model):
             )
         else:
             var.assign_add(epsilon_w)
-            
+
     def _gradients_order2_norm(self, gradients):
+        """Compute the norm of the gradients."""
         norm = tf.norm(
-            tf.stack([
-                tf.norm(grad) for grad in gradients if grad is not None
-            ])
+            tf.stack([tf.norm(grad) for grad in gradients if grad is not None])
         )
         return norm
 
