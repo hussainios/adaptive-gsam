@@ -1,2 +1,1 @@
-from gsam.gsam import GSAM
-from gsam.gsam import AGSAM
+from gsam.gsam import GSAM, AGSAM
